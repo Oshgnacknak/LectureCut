@@ -2,38 +2,37 @@
 
 import argparse
 import atexit
-from itertools import takewhile
-import multiprocessing
 import cv2
 import enlighten
 import ffmpeg
+import multiprocessing
 import os
 import textwrap
 import time
 import uuid
 import vad
-from joblib import Parallel, delayed
 from helper import delete_directory_recursively, read_progress
-
+from itertools import takewhile
+from joblib import Parallel, delayed
+from pathlib import Path
 
 N_CORES = multiprocessing.cpu_count()
 PROCESSES = N_CORES // 4
 
-# TODO: use pathlib
-CACHE_PREFIX = "./" # needs to end with a slash 
+CACHE_PREFIX = Path("cache")
 
 instances = {}
 
 def init_cache(instance):
-  cache_path = CACHE_PREFIX + f"/{instance}/"
+  cache_path = CACHE_PREFIX / instance
   if os.path.exists(cache_path):
     raise Exception("Cache already exists")
-  os.mkdir(cache_path)
-  os.mkdir(cache_path + "/segments")
-  os.mkdir(cache_path + "/cutSegments")
+  os.mkdir(cache_path) # TODO: use https://stackoverflow.com/a/600612, create parents
+  os.mkdir(cache_path / "segments")
+  os.mkdir(cache_path / "cutSegments")
 
 def cleanup(instance):
-  cache_path = CACHE_PREFIX + f"/{instance}/"
+  cache_path = CACHE_PREFIX / instance
   delete_directory_recursively(cache_path)
 
 def generate_cut_list(instance):
@@ -46,7 +45,7 @@ def prepare_video(manager, instance):
   _analyse_segments(manager, instance)
 
 def _split_video(manager, instance):
-  cache_path = CACHE_PREFIX + f"/{instance}/"
+  cache_path = CACHE_PREFIX / instance
   file = instances[instance]["file"]
 
   total_input_length = _get_video_length(None, file)
@@ -56,7 +55,7 @@ def _split_video(manager, instance):
   split = (
     ffmpeg
     .input(file)
-    .output(cache_path + "segments/out%05d.ts",
+    .output(str(cache_path / "segments" / "out%05d.ts"),
         f="segment",
         c="copy",
         reset_timestamps=1)
@@ -72,16 +71,16 @@ def _split_video(manager, instance):
 def _analyse_segments(manager, instance):
   global instances
   instances[instance]["segments"] = {}
-  cache_path = CACHE_PREFIX + f"/{instance}/"
+  cache_path = CACHE_PREFIX / instance
   
-  segments = sorted(os.listdir(cache_path + "segments"))
+  segments = sorted(os.listdir(cache_path / "segments"))
   pbar = manager.counter(total=len(segments),
       desc="Analysing  ",
       unit="segments")
 
   durations = Parallel(n_jobs=PROCESSES)(
       delayed(_get_video_length)
-      (pbar, f"{cache_path}segments/{path}")
+      (pbar, str(cache_path / "segments" / path))
       for path in segments)
   # calculate start end map
   total_duration = 0
@@ -103,7 +102,7 @@ def _get_video_length(pbar, videoPath):
 def transcode(manger, instance):
   global instances
 
-  cache_path = CACHE_PREFIX + f"/{instance}/"
+  cache_path = CACHE_PREFIX / instance
   segments = instances[instance]["segments"]
   cuts = instances[instance]["cuts"]
 
@@ -126,8 +125,8 @@ def transcode(manger, instance):
 
     # if completely enclosed by a cut, copy
     if first_cut[0] <= segment["start"] and first_cut[1] >= segment["end"]:
-      os.rename(f"{cache_path}segments/out{i:05d}.ts",
-          f"{cache_path}cutSegments/out{i:05d}.ts")
+      os.rename(str(cache_path / "segments" / f"out{i:05d}.ts"),
+          str(cache_path / "cutSegments" / f"out{i:05d}.ts"))
       pbar.update()
       return
 
@@ -151,8 +150,8 @@ def transcode(manger, instance):
     for j,trim in enumerate(keep):
       (
         ffmpeg
-        .input(f"{cache_path}segments/out{i:05d}.ts")
-        .output(f"{cache_path}cutSegments/out{i:05d}_{j:03d}.ts",
+        .input(str(cache_path / "segments" / f"out{i:05d}.ts"))
+        .output(str(cache_path / "cutSegments" / f"out{i:05d}_{j:03d}.ts"),
             f="mpegts",
             ss=trim[0],
             to=trim[1],
@@ -176,10 +175,10 @@ def transcode(manger, instance):
 
 
 def concat_segments(manager, instance):
-  cache_path = f"{CACHE_PREFIX}{instance}/"
+  cache_path = CACHE_PREFIX / instance
   output = instances[instance]["output"]
-  with open(f"{cache_path}list.txt", "w") as f:
-    for file in sorted(os.listdir(f"{cache_path}cutSegments")):
+  with open(str(cache_path / "list.txt"), "w") as f:
+    for file in sorted(os.listdir(str(cache_path / "cutSegments"))):
       f.write(f"file 'cutSegments/{file}'\n")
   total_cut_length = sum([x[1] - x[0] for x in instances[instance]["cuts"]])
   bar_total = int(total_cut_length * 1000)
@@ -198,7 +197,7 @@ def concat_segments(manager, instance):
     }
   concat = (
     ffmpeg
-    .input(f"{cache_path}list.txt", f="concat", safe=0)
+    .input(str(cache_path / "list.txt"), f="concat", safe=0)
     .output(output, **outputargs)
     .global_args("-progress", "pipe:1")
     .global_args("-loglevel", "error")
@@ -381,7 +380,7 @@ def shotdown_cleanup():
   time.sleep(3)
   for instance in instances:
     instances[instance]["manager"].stop()
-    cachePath = f"{CACHE_PREFIX}{instance}/"
+    cachePath = str(CACHE_PREFIX / instance)
     if os.path.isdir(cachePath):
       delete_directory_recursively(cachePath)
 
